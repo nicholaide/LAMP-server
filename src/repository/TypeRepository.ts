@@ -1,31 +1,21 @@
-import { SQL, Encrypt, Decrypt, Root } from "../app"
+import { Database, SQL } from "../app"
 import ScriptRunner from "../utils/ScriptRunner"
 import sql from "mssql"
-import { Participant } from "../model/Participant"
-import { Study } from "../model/Study"
-import { Researcher } from "../model/Researcher"
-import { Activity } from "../model/Activity"
 import { DynamicAttachment } from "../model/Type"
-import { ResearcherRepository } from "../repository/ResearcherRepository"
-import { ParticipantRepository } from "../repository/ParticipantRepository"
-import { StudyRepository } from "../repository/StudyRepository"
-import { ActivityRepository } from "../repository/ActivityRepository"
-
-export function Identifier_pack(components: any[]): string {
-  if (components.length === 0) return ""
-  return Buffer.from(components.join(":")).toString("base64").replace(/=/g, "~")
-}
-export function Identifier_unpack(components: string): any[] {
-  if (components.match(/^G?U\d+$/)) return []
-  return Buffer.from((<string>components).replace(/~/g, "="), "base64")
-    .toString("utf8")
-    .split(":")
-}
+import {
+  Identifier_unpack,
+  Participant_pack_id,
+  Researcher_pack_id,
+  Activity_unpack_id,
+  Study_pack_id,
+  _migrator_dual_table,
+} from "./migrate"
+import { CredentialRepository } from "./CredentialRepository"
 
 export class TypeRepository {
   public static async _parent(type_id: string): Promise<{}> {
     const result: any = {} // obj['#parent'] === [null, undefined] -> top-level object
-    for (const parent_type of TypeRepository._parent_type(type_id))
+    for (const parent_type of await TypeRepository._parent_type(type_id))
       result[parent_type] = await TypeRepository._parent_id(type_id, parent_type)
     return result
   }
@@ -33,36 +23,64 @@ export class TypeRepository {
   /**
    * Get the self type of a given ID.
    */
-  public static _self_type(type_id: string): string {
-    const components = Identifier_unpack(type_id)
-    const from_type: string = components.length === 0 ? (<any>Participant).name : components[0]
-    return from_type
+  public static async _self_type(type_id: string): Promise<string> {
+    try {
+      await Database.use("participant").head(type_id)
+      return "Participant"
+    } catch (e) {}
+    try {
+      await Database.use("researcher").head(type_id)
+      return "Researcher"
+    } catch (e) {}
+    try {
+      await Database.use("study").head(type_id)
+      return "Study"
+    } catch (e) {}
+    try {
+      await Activity_self_type(type_id)
+      //await Database.use("activity").head(type_id)
+      return "Activity"
+    } catch (e) {}
+    try {
+      await Database.use("sensor").head(type_id)
+      return "Sensor"
+    } catch (e) {}
+    return "__broken_id__"
+  }
+
+  public static async _owner(type_id: string): Promise<string | null> {
+    try {
+      return ((await Database.use("participant").get(type_id)) as any)["#parent"]
+    } catch (e) {}
+    try {
+      await Database.use("researcher").head(type_id)
+      return null
+    } catch (e) {}
+    try {
+      return ((await Database.use("study").get(type_id)) as any)["#parent"]
+    } catch (e) {}
+    try {
+      return (await Activity_parent_id(type_id, "Study")) ?? null
+      //return ((await Database.use("activity").get(type_id)) as any)["#parent"]
+    } catch (e) {}
+    try {
+      return ((await Database.use("sensor").get(type_id)) as any)["#parent"]
+    } catch (e) {}
+    return null
   }
 
   /**
    * Get all parent types of a given ID.
    */
-  public static _parent_type(type_id: string): string[] {
+  public static async _parent_type(type_id: string): Promise<string[]> {
     const parent_types: { [type: string]: string[] } = {
       Researcher: [],
       Study: ["Researcher"],
       Participant: ["Study", "Researcher"],
       Activity: ["Study", "Researcher"],
+      Sensor: ["Study", "Researcher"],
     }
-    /*
-		// TODO:
-		const shortcode_map = {
-			'Researcher': 'R',
-			'R': 'Researcher',
-			'Study': 'S',
-			'S': 'Study',
-			'Participant': 'P',
-			'P': 'Participant',
-			'Activity': 'A',
-			'A': 'Activity',
-		}
-		*/
-    return parent_types[TypeRepository._self_type(type_id)]
+    return parent_types[await TypeRepository._self_type(type_id)]
   }
 
   /**
@@ -70,18 +88,22 @@ export class TypeRepository {
    */
   public static async _parent_id(type_id: string, type: string): Promise<string> {
     const self_type: { [type: string]: Function } = {
-      Researcher: ResearcherRepository,
-      Study: StudyRepository,
-      Participant: ParticipantRepository,
-      Activity: ActivityRepository,
+      Researcher: Researcher_parent_id,
+      Study: Study_parent_id,
+      Participant: Participant_parent_id,
+      Activity: Activity_parent_id,
+      //Sensor: Sensor_parent_id,
     }
-    return await (<any>self_type[TypeRepository._self_type(type_id)])._parent_id(type_id, self_type[type])
+    return await (self_type[await TypeRepository._self_type(type_id)] as any)(type_id, type)
   }
 
   /**
    *
    */
   public static async _set(mode: "a" | "b", type: string, id: string, key: string, value?: DynamicAttachment | any) {
+    const [, _export_table] = await _migrator_dual_table()
+    id = _export_table[id] ?? id
+    type = _export_table[type] ?? type
     let result: sql.IResult<any>
     if (mode === "a" && !value /* null | undefined */) {
       /* DELETE */ result = await SQL!.request().query(`
@@ -168,9 +190,12 @@ export class TypeRepository {
    * TODO: if key is undefined just return every item instead as an array
    */
   public static async _get(mode: "a" | "b", id: string, key: string): Promise<DynamicAttachment[] | any | undefined> {
+    const [, _export_table] = await _migrator_dual_table()
+    const _legacy_id = id
+    id = _export_table[id!] ?? id!
     const components = Identifier_unpack(id)
-    const from_type: string = components.length === 0 ? (<any>Participant).name : components[0]
-    let parents = await TypeRepository._parent(<string>id)
+    const from_type: string = components.length === 0 ? "Participant" : components[0]
+    let parents = await TypeRepository._parent(_legacy_id)
     if (Object.keys(parents).length === 0) parents = { " ": " " } // for the SQL 'IN' operator
 
     if (mode === "a") {
@@ -232,10 +257,13 @@ export class TypeRepository {
   }
 
   public static async _list(mode: "a" | "b", id: string): Promise<string[]> {
+    const [, _export_table] = await _migrator_dual_table()
+    const _legacy_id = id
+    id = _export_table[id!] ?? id!
     // Determine the parent type(s) of `type_id` first.
     const components = Identifier_unpack(id)
-    const from_type: string = components.length === 0 ? (<any>Participant).name : components[0]
-    let parents = await TypeRepository._parent(<string>id)
+    const from_type: string = components.length === 0 ? "Participant" : components[0]
+    let parents = await TypeRepository._parent(_legacy_id)
     if (Object.keys(parents).length === 0) parents = { " ": " " } // for the SQL 'IN' operator
 
     if (mode === "a") {
@@ -305,9 +333,9 @@ export class TypeRepository {
   }
 
   /**
-   *
+   * FIXME: THIS FUNCTION IS DEPRECATED/OUT OF DATE/DISABLED (!!!)
    */
-  public static async _process_triggers() {
+  public static async _process_triggers(): Promise<void> {
     console.log("Processing accumulated attachment triggers...")
 
     // Request the set of all updates.
@@ -327,12 +355,10 @@ export class TypeRepository {
       ...x,
       _id:
         x.Type === "Participant"
-          ? ParticipantRepository._pack_id({ study_id: Decrypt(<string>x._SID) })
-          : ResearcherRepository._pack_id({ admin_id: x.ID }),
+          ? Participant_pack_id({ study_id: x._SID /*FIXME:Decrypt(<string>x._SID)*/ })
+          : Researcher_pack_id({ admin_id: x.ID }),
       _admin:
-        x.Type === "Participant"
-          ? ResearcherRepository._pack_id({ admin_id: x._AID })
-          : ResearcherRepository._pack_id({ admin_id: x.ID }),
+        x.Type === "Participant" ? Researcher_pack_id({ admin_id: x._AID }) : Researcher_pack_id({ admin_id: x.ID }),
     }))
     const ax_set1 = accumulated_set.map((x) => x._id)
     const ax_set2 = accumulated_set.map((x) => x._admin)
@@ -386,21 +412,14 @@ export class TypeRepository {
           return accumulated_set
             .filter((y) => y.Type === "Participant" && y._admin === x.from && y._id !== y._admin)
             .map((y) => ({ ...x, to: y._id }))
-        return [{ ...x, to: <string>x.from }]
+        return [{ ...x, to: x.from as string }]
       })
-    ;(<any[]>[]).concat(...working_set).forEach((x) =>
+    ;([] as any[]).concat(...working_set).forEach(async (x) =>
       TypeRepository._invoke(x, {
         /* The security context originator for the script 
 				   with a magic placeholder to indicate to the LAMP server
 				   that the script's API requests are pre-authenticated. */
-        token:
-          "LAMP" +
-          Encrypt(
-            JSON.stringify({
-              identity: { from: x.from, to: x.to },
-              cosigner: Root,
-            })
-          ),
+        token: await CredentialRepository._packCosignerData(x.from, x.to),
 
         /* What object was this automation run for on behalf of an agent? */
         object: {
@@ -412,19 +431,18 @@ export class TypeRepository {
         event: ["ActivityEvent", "SensorEvent"],
       })
         .then((y) => {
-          TypeRepository._set("a", x.to!, <string>x.from!, x.key! + "/output", y)
+          TypeRepository._set("a", x.to, x.from as string, x.key + "/output", y)
         })
         .catch((err) => {
           TypeRepository._set(
             "a",
-            x.to!,
-            <string>x.from!,
-            x.key! + "/output",
+            x.to,
+            x.from as string,
+            x.key + "/output",
             JSON.stringify({ output: null, logs: err })
           )
         })
     )
-
     /* // TODO: This is for a single item only;
 		let attachments: DynamicAttachment[] = await Promise.all((await TypeRepository._list('b', <string>type_id))
 												.map(async x => (await TypeRepository._get('b', <string>type_id, x))))
@@ -437,118 +455,107 @@ export class TypeRepository {
   }
 }
 
-/**
- * Set up a 5-minute interval callback to invoke triggers.
- */
-/*setInterval(() => {
-  if (!!SQL) TypeRepository._process_triggers()
-}, 5 * 60 * 1000)*/
-
-// TODO: below is to convert legacy scheduling into modern cron-like versions
-/* FIXME:
-$obj->schedule = isset($raw->schedule) ? array_merge(...array_map(function($x) {
-	$duration = new DurationInterval(); $ri = $x->repeat_interval;
-	if ($ri >= 0 && $ri <= 4) { // hourly
-		$h = ($ri == 4 ? 12 : ($ri == 3 ? 6 : ($ri == 2 ? 3 : 1)));
-		$duration->interval = new CalendarComponents();
-		$duration->interval->hour = $h;
-	} else if ($ri >= 5 && $ri <= 10) { // weekly+
-		if ($ri == 6) {
-			$duration = [
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
-			];
-			$duration[0]->interval->weekday = 2;
-			$duration[1]->interval->weekday = 4;
-		} else if ($ri == 7) {
-			$duration = [
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
-			];
-			$duration[0]->interval->weekday = 1;
-			$duration[1]->interval->weekday = 3;
-			$duration[2]->interval->weekday = 5;
-		} else {
-			$duration = [
-				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
-			];
-			$duration[0]->interval->day = ($ri == 5 ? 1 : null);
-			$duration[0]->interval->week_of_month = ($ri == 9 ? 2 : ($ri == 8 ? 1 : null));
-			$duration[0]->interval->month = ($ri == 10 ? 1 : null);
-		}
-	} else if ($ri == 11 && count($x->custom_time) == 1) { // custom+
-		$duration->start = strtotime($x->custom_time[0]) * 1000;
-		$duration->repeat_count = 1;
-	} else if ($ri == 11 && count($x->custom_time) > 2) { // custom*
-		$int_comp = (new DateTime($x->custom_time[0]))
-						->diff(new DateTime($x->custom_time[1]));
-		$duration->start = strtotime($x->custom_time[0]) * 1000;
-		$duration->interval = new CalendarComponents();
-		$duration->interval->year = ($int_comp->y == 0 ? null : $int_comp->y);
-		$duration->interval->month = ($int_comp->m == 0 ? null : $int_comp->m);
-		$duration->interval->day = ($int_comp->d == 0 ? null : $int_comp->d);
-		$duration->interval->hour = ($int_comp->h == 0 ? null : $int_comp->h);
-		$duration->interval->minute = ($int_comp->i == 0 ? null : $int_comp->i);
-		$duration->interval->second = ($int_comp->s == 0 ? null : $int_comp->s);
-		$duration->repeat_count = count($x->custom_time) - 1;
-	} else if ($ri == 12) { // none
-		$duration->start = strtotime($x->time) * 1000;
-		$duration->repeat_count = 1;
-	}
-	return is_array($duration) ? $duration : [$duration];
-}, $raw->schedule)) : null;
-*/
-
-// Schedule:
-//      - Admin_CTestSchedule, Admin_SurveySchedule
-//          - AdminID, CTestID/SurveyID, Version*(C), ScheduleDate, SlotID, Time, RepeatID, IsDeleted
-//      - Admin_CTestScheduleCustomTime, Admin_SurveyScheduleCustomTime, Admin_BatchScheduleCustomTime
-//          - Time
-//      - Admin_BatchSchedule
-//          - AdminID, BatchName, ScheduleDate, SlotID, Time, RepeatID, IsDeleted
-//      - Admin_BatchScheduleCTest, Admin_BatchScheduleSurvey
-//          - CTestID/SurveyID, Version*(C), Order
-//
-// Settings:
-//      - Admin_CTestSurveySettings
-//          - AdminID, CTestID, SurveyID
-//      - Admin_JewelsTrailsASettings, Admin_JewelsTrailsBSettings
-//          - AdminID, ... (")
-//      - SurveyQuestions
-//          - SurveyID, QuestionText, AnswerType, IsDeleted
-//      - SurveyQuestionsOptions
-//          - QuestionID, OptionText
-
-// https://en.wikipedia.org/wiki/Cron#CRON_expression
-/*
-* * * * * *
-| | | | | | 
-| | | | | +-- Year              (range: 1900-3000)
-| | | | +---- Day of the Week   (range: 1-7; L=last, #=ordinal(range: 1-4))
-| | | +------ Month of the Year (range: 1-12)
-| | +-------- Day of the Month  (range: 1-31; L=last, W=nearest-weekday, #=ordinal(range: 1-52))
-| +---------- Hour              (range: 0-23)
-+------------ Minute            (range: 0-59)
-*/
-
-/*
-
-
-
-enum RepeatTypeLegacy {
-	hourly = 'hourly', // 0 * * * * *
-	every3h = 'every3h', // 0 * /3 * * * *
-	every6h = 'every6h', // 0 * /6 * * * *
-	every12h = 'every12h', // 0 * /12 * * * *
-	daily = 'daily', // 0 0 * * * *
-	weekly = 'weekly', // 0 0 * * 0 *
-	biweekly = 'biweekly', // 0 0 1,15 * * *
-	monthly = 'monthly', // 0 0 1 * * *
-	bimonthly = 'bimonthly', // 0 0 1 * /2 * *
-	custom = 'custom', // 1 2 3 4 5 6
-	none = 'none' // 0 0 0 0 0 0
+export async function Researcher_parent_id(id: string, type: string): Promise<string | undefined> {
+  switch (type) {
+    default:
+      return undefined // throw new Error('400.invalid-identifier')
+  }
+}
+export async function Study_parent_id(id: string, type: string): Promise<string | undefined> {
+  switch (type) {
+    case "Researcher":
+      const obj: any = await Database.use("study").get(id)
+      return obj["#parent"]
+    default:
+      throw new Error("400.invalid-identifier")
+  }
+}
+export async function Participant_parent_id(id: string, type: string): Promise<string | undefined> {
+  let obj: any
+  switch (type) {
+    case "Study":
+      obj = await Database.use("participant").get(id)
+      return obj["#parent"]
+    case "Researcher":
+      obj = await Database.use("participant").get(id)
+      obj = await Database.use("study").get(obj["#parent"])
+      return obj["#parent"]
+    default:
+      throw new Error("400.invalid-identifier")
+  }
+}
+export async function Activity_self_type(id: string): Promise<void> {
+  const [, _export_table] = await _migrator_dual_table()
+  const _export_or_die = (id: string): string => {
+    if (_export_table[id]) return _export_table[id]
+    else throw new Error("500.invalid-migratable-id")
+  }
+  if (Identifier_unpack(_export_or_die(id))[0] !== "Activity") throw new Error()
+}
+export async function Activity_parent_id(id: string, type: string): Promise<string | undefined> {
+  const [_lookup_table, _export_table] = await _migrator_dual_table()
+  const _export_or_die = (id: string): string => {
+    if (_export_table[id]) return _export_table[id]
+    else throw new Error("500.invalid-migratable-id")
+  }
+  const { ctest_id, survey_id, group_id } = Activity_unpack_id(_export_or_die(id))
+  switch (type) {
+    case "Study":
+    case "Researcher":
+      if (survey_id > 0 /* survey */) {
+        const result = (
+          await SQL!.request().query(`
+						SELECT AdminID AS value
+						FROM Survey
+						WHERE SurveyID = '${survey_id}'
+					;`)
+        ).recordset // IsDeleted = 0 AND
+        return result.length === 0
+          ? undefined
+          : _lookup_table[
+              (type === "Researcher" ? Researcher_pack_id : Study_pack_id)({
+                admin_id: result[0].value,
+              })
+            ]
+      } else if (ctest_id > 0 /* ctest */) {
+        const result = (
+          await SQL!.request().query(`
+						SELECT AdminID AS value
+						FROM Admin_CTestSettings
+						WHERE AdminCTestSettingID = '${ctest_id}'
+					;`)
+        ).recordset // Status = 1 AND
+        return result.length === 0
+          ? undefined
+          : _lookup_table[
+              (type === "Researcher" ? Researcher_pack_id : Study_pack_id)({
+                admin_id: result[0].value,
+              })
+            ]
+      } else if (group_id > 0 /* group */) {
+        const result = (
+          await SQL!.request().query(`
+						SELECT AdminID AS value
+						FROM Admin_BatchSchedule
+						WHERE AdminBatchSchID = '${group_id}'
+					;`)
+        ).recordset // IsDeleted = 0 AND
+        return result.length === 0
+          ? undefined
+          : _lookup_table[
+              (type === "Researcher" ? Researcher_pack_id : Study_pack_id)({
+                admin_id: result[0].value,
+              })
+            ]
+      } else return undefined
+    default:
+      throw new Error("400.invalid-identifier")
+  }
 }
 
-
+/*
+// Set up a 5-minute interval callback to invoke triggers.
+setInterval(() => {
+  if (!!SQL) TypeRepository._process_triggers()
+}, 5 * 60 * 1000)
 */

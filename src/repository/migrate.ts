@@ -1,7 +1,6 @@
 import { Database, SQL, Encrypt, Decrypt } from "../app"
 import { SensorEvent, SensorName, LocationContext, SocialContext } from "../model/SensorEvent"
 import { ActivityEvent, TemporalSlice } from "../model/ActivityEvent"
-import { ActivityRepository } from "../repository/ActivityRepository"
 import { customAlphabet } from "nanoid"
 import { MaybeDocument } from "nano"
 const uuid = customAlphabet("1234567890abcdefghjkmnpqrstvwxyz", 20) // crockford-32
@@ -35,7 +34,7 @@ Object.defineProperty(Number, "parse", {
 ///
 ///
 
-export async function _migrate_sensor_event() {
+export async function _migrate_sensor_event(): Promise<void> {
   if (_migrator_active) {
     return console.info("sensor_event migration aborted due to existing migrator activity")
   }
@@ -303,7 +302,7 @@ export async function _migrate_activity_event(): Promise<void> {
         ;(activity_event as any)["#parent"] = Decrypt(row.uid)
 
         // Map internal ID sub-components into the single mangled ID form.
-        const _activity_original_id = ActivityRepository._pack_id({
+        const _activity_original_id = Activity_pack_id({
           ctest_id: entry.LegacyCTestID !== null ? row.aid : 0,
           survey_id: entry.LegacyCTestID === null ? row.aid : 0,
           group_id: 0,
@@ -320,9 +319,6 @@ export async function _migrate_activity_event(): Promise<void> {
 
         // Decrypt all static data properties if known to be encrypted.
         // TODO: Encryption of fields should also be found in the activity index table!
-        //if (!!activity_event.static_data.survey_name)
-        //  activity_event.static_data.survey_name = "___DEPRECATED_USE_ACTIVITY_ID_INSTEAD___"
-        //activity_event.static_data.survey_id = undefined
         if (!!activity_event.static_data.drawn_fig_file_name) {
           const fname =
             "file://./_assets/3dfigure/" +
@@ -406,14 +402,321 @@ export async function _migrate_activity_event(): Promise<void> {
   }
 }
 
-export const _migrator_lookup_table = async (): Promise<{ [key: string]: string }> => {
-  const _res = await Database.use("root").baseView("", "", { viewPath: "_local_docs" }, { include_docs: true })
-  return _res.rows.reduce((z: any, x: any) => ({ ...z, [x.id.replace("_local/", "")]: x.doc.value }), {})
+export async function _migrate_participant(): Promise<void> {
+  try {
+    const MigratorLink = Database.use("root")
+    const _lookup_table = await _migrator_lookup_table()
+    const _lookup_migrator_id = (legacyID: string): string => {
+      let match = _lookup_table[legacyID]
+      if (match === undefined) {
+        match = uuid() // 20-char id for non-Participant objects
+        _lookup_table[legacyID] = match
+        console.log(`inserting migrator link: ${legacyID} => ${match}`)
+        MigratorLink.insert({ _id: `_local/${legacyID}`, value: match } as MaybeDocument)
+      }
+      return match
+    }
+    const result = await SQL!.request().query(`
+      SELECT 
+          UserID AS _oldID,
+          AdminID AS _parent,
+          StudyId AS _id, 
+          IsDeleted AS _deleted
+      FROM Users
+    ;`)
+    Database.use("participant").bulk({
+      docs:
+        result?.recordset?.map((x: any) => ({
+          _id: Decrypt(x._id),
+          _deleted: x._deleted,
+          "#parent": _lookup_migrator_id(Study_pack_id({ admin_id: x._parent })),
+        })) ?? [],
+    })
+  } catch (e) {
+    console.error(e)
+  }
 }
 
+export async function _migrate_study(): Promise<void> {
+  try {
+    const MigratorLink = Database.use("root")
+    const _lookup_table = await _migrator_lookup_table()
+    const _lookup_migrator_id = (legacyID: string): string => {
+      let match = _lookup_table[legacyID]
+      if (match === undefined) {
+        match = uuid() // 20-char id for non-Participant objects
+        _lookup_table[legacyID] = match
+        console.log(`inserting migrator link: ${legacyID} => ${match}`)
+        MigratorLink.insert({ _id: `_local/${legacyID}`, value: match } as MaybeDocument)
+      }
+      return match
+    }
+    const result = await SQL!.request().query(`
+      SELECT 
+          AdminID AS _id,
+          FirstName AS fname, 
+          LastName AS lname,
+          IsDeleted AS _deleted
+      FROM Admin
+    ;`)
+    Database.use("study").bulk({
+      docs:
+        result?.recordset?.map((x: any) => ({
+          _id: _lookup_migrator_id(Study_pack_id({ admin_id: x._id })),
+          _deleted: x._deleted,
+          "#parent": _lookup_migrator_id(Researcher_pack_id({ admin_id: x._id })),
+          name: [Decrypt(x.fname), Decrypt(x.lname)].join(" "),
+        })) ?? [],
+    })
+    Database.use("researcher").bulk({
+      docs:
+        result?.recordset?.map((x: any) => ({
+          _id: _lookup_migrator_id(Researcher_pack_id({ admin_id: x._id })),
+          _deleted: x._deleted,
+          name: [Decrypt(x.fname), Decrypt(x.lname)].join(" "),
+        })) ?? [],
+    })
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrate_credential(_decrypt = false): Promise<void> {
+  const info = await Database.use("credential").info()
+  if (info.doc_count + info.doc_del_count > 0) return // already initialized
+  try {
+    const _lookup_table = await _migrator_lookup_table()
+    const out1 = (
+      await SQL!.request().query(`
+        SELECT AdminID, Email, Password, IsDeleted
+        FROM Admin
+      ;`)
+    ).recordset.map((x) => ({
+      _deleted: x["IsDeleted"],
+      origin: _lookup_table[Researcher_pack_id({ admin_id: Number.parse(x["AdminID"]) ?? 0 })],
+      access_key: Decrypt(x["Email"]),
+      secret_key: _decrypt ? Decrypt(x["Password"], "AES256") : x["Password"],
+      description: "Default Credential",
+    }))
+    console.log(`[Credential_Admin] migrating ${out1.length} credentials`)
+    const out2 = (
+      await SQL!.request().query(`
+        SELECT StudyId, Email, Password, IsDeleted
+        FROM Users
+      ;`)
+    ).recordset.map((x) => ({
+      _deleted: x["IsDeleted"],
+      origin: Decrypt(x["StudyId"]),
+      access_key: Decrypt(x["Email"]),
+      secret_key: _decrypt ? Decrypt(x["Password"], "AES256") : x["Password"],
+      description: "Default Credential",
+    }))
+    console.log(`[Credential_User] migrating ${out2.length} credentials`)
+    const out3 = (
+      await SQL!.request().query(`
+        SELECT ObjectID, Value
+        FROM LAMP_Aux.dbo.OOLAttachment
+        WHERE ObjectType = 'Credential'
+      ;`)
+    ).recordset
+      .map((x) => JSON.parse(x["Value"]))
+      .map((x) => ({
+        ...x,
+        origin: x.origin.startsWith("UmVz") ? _lookup_table[x.origin] : x.origin,
+        secret_key: _decrypt ? Decrypt(x.secret_key, "AES256") : x.secret_key,
+      }))
+    console.log(`[Credential_Tag] migrating ${out3.length} credentials`)
+    const _p = ((await Database.use("root").get("#master_config")) as any)?.data.password
+    const out4 =
+      _p === undefined
+        ? []
+        : [{ origin: null, access_key: "admin", secret_key: _p, description: "System Administrator Credential" }]
+    console.log(`[Credential_Root] migrating ${out4.length} credentials`)
+    await Database.use("credential").bulk({ docs: [...out1, ...out2, ...out3, ...out4] })
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_push_credential(): Promise<void> {
+  try {
+    //
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_pop_credential(): Promise<void> {
+  try {
+    //
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_push_participant(study_id: string, _id: string): Promise<void> {
+  try {
+    const _lookup_table = await _migrator_export_table()
+    const _lookup_migrator_id = (legacyID: string): string => {
+      const match = _lookup_table[legacyID]
+      if (match === undefined) {
+        throw new Error("500.participant-push-no-legacy-study-match")
+      }
+      return match
+    }
+    const result1 = await SQL!.request().query(`
+			INSERT INTO Users (
+                Email, 
+                Password,
+                StudyCode, 
+                StudyId, 
+                CreatedOn, 
+                Status,
+                AdminID
+            )
+			VALUES (
+		        '${Encrypt(_id + "@lamp.com")}', 
+		        '',
+		        '${Encrypt("001")}',
+		        '${Encrypt(_id)}',
+		        GETDATE(), 
+		        1,
+		        ${Study_unpack_id(_lookup_migrator_id(study_id)).admin_id}
+			);
+			SELECT SCOPE_IDENTITY() AS id;
+		`)
+    if (result1.recordset.length === 0) {
+      throw new Error("500.participant-database-migration-push-failed")
+    }
+    const result2 = await SQL!.request().query(`
+            INSERT INTO UserSettings (
+                UserID, 
+                AppColor,
+                SympSurvey_SlotID,
+                SympSurvey_RepeatID,
+                CognTest_SlotID,
+                CognTest_RepeatID,
+                [24By7ContactNo], 
+                PersonalHelpline,
+                PrefferedSurveys,
+                PrefferedCognitions,
+                Language
+            )
+			VALUES (
+			    ${result1.recordset[0]["id"]},
+		        'dJjw5FK/FXK6qU32frXHvg==',
+		        1,
+		        1,
+		        1,
+		        1,
+		        '',
+		        '',
+		        '',
+		        '',
+		        'en'
+			);
+    `)
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_pop_participant(_id: string): Promise<void> {
+  try {
+    const res = await SQL!.request().query(`
+			IF EXISTS(SELECT UserID FROM Users WHERE StudyId = '${Encrypt(_id)}' AND IsDeleted != 1)
+				UPDATE Users SET IsDeleted = 1 WHERE StudyId = '${Encrypt(_id)}';
+		`)
+    if (res.rowsAffected.length === 0 || res.rowsAffected[0] === 0) {
+      throw new Error("500.participant-database-migration-pop-failed")
+    }
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_push_study(_id: string): Promise<void> {
+  try {
+    const result = await SQL!.request().query(`
+			INSERT INTO Admin (
+                FirstName, 
+                LastName, 
+                CreatedOn, 
+                AdminType
+            )
+            OUTPUT INSERTED.AdminID AS id
+			VALUES (
+		        '${Encrypt(" ")}',
+		        '${Encrypt(" ")}',
+		        GETDATE(), 
+		        2
+			);
+		`)
+    if (result.recordset.length === 0) {
+      throw new Error("500.study-migration-create-failed")
+    }
+    const result2 = await SQL!.request().query(`
+			INSERT INTO Admin_CTestSettings (
+				AdminID,
+				CTestID,
+				Status,
+				Notification
+			)
+			SELECT
+				${result.recordset[0]["id"]},
+				CTestID,
+				0,
+				0
+			FROM CTest;
+    `)
+    const legacyID = Researcher_pack_id({ admin_id: result.recordset[0]["id"] })
+    console.log(`inserting migrator link: ${legacyID} => ${_id}`)
+    await Database.use("root").insert({ _id: `_local/${legacyID}`, value: _id } as MaybeDocument)
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+export async function _migrator_pop_study(_id: string): Promise<void> {
+  try {
+    const _lookup_table = await _migrator_export_table()
+    const _lookup_migrator_id = (legacyID: string): string => {
+      const match = _lookup_table[legacyID]
+      if (match === undefined) {
+        throw new Error("500.study-pop-no-legacy-match")
+      }
+      return match
+    }
+    const admin_id = Study_unpack_id(_lookup_migrator_id(_id)).admin_id
+    if (admin_id === 1) throw new Error("400.delete-failed-superadmin")
+    const result = await SQL!.request().query(`
+			UPDATE Admin SET IsDeleted = 1 WHERE AdminID = ${admin_id} AND IsDeleted = 0;
+		`)
+    if (result.rowsAffected[0] === 0) throw new Error("404.object-not-found")
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+// old ID (table PK) -> new ID (random UUID)
+export const _migrator_lookup_table = async (): Promise<{ [key: string]: string }> => {
+  return (await _migrator_dual_table())[0]
+}
+
+// new ID (random UUID) -> old ID (table PK)
 export const _migrator_export_table = async (): Promise<{ [key: string]: string }> => {
+  return (await _migrator_dual_table())[1]
+}
+
+// BOTH of the above; more performant as well
+export const _migrator_dual_table = async (): Promise<[{ [key: string]: string }, { [key: string]: string }]> => {
   const _res = await Database.use("root").baseView("", "", { viewPath: "_local_docs" }, { include_docs: true })
-  return _res.rows.reduce((z: any, x: any) => ({ ...z, [x.doc.value]: x.id.replace("_local/", "") }), {})
+  const output: { [key: string]: string }[] = [{}, {}]
+  for (const x of _res.rows) {
+    output[0][x.id.replace("_local/", "")] = x.doc.value
+    output[1][x.doc.value] = x.id.replace("_local/", "")
+  }
+  return output as any
 }
 
 /**
@@ -566,6 +869,54 @@ const _escapeMSSQL = (val: string) =>
         return "\\" + s
     }
   })
+
+export function Identifier_pack(components: any[]): string {
+  if (components.length === 0) return ""
+  return Buffer.from(components.join(":")).toString("base64").replace(/=/g, "~")
+}
+export function Identifier_unpack(components: string): any[] {
+  if (components.match(/^G?U\d+$/)) return []
+  return Buffer.from((<string>components).replace(/~/g, "="), "base64")
+    .toString("utf8")
+    .split(":")
+}
+export function Researcher_pack_id(components: { admin_id?: number }): string {
+  return Identifier_pack(["Researcher", components.admin_id || 0])
+}
+export function Researcher_unpack_id(id: string): { admin_id: number } {
+  const components = Identifier_unpack(id)
+  if (components[0] !== "Researcher") throw new Error("400.invalid-identifier")
+  const result = components.slice(1).map((x) => Number.parse(x) ?? 0)
+  return { admin_id: result[0] }
+}
+export function Study_pack_id(components: { admin_id?: number }): string {
+  return Identifier_pack(["Study", components.admin_id || 0])
+}
+export function Study_unpack_id(id: string): { admin_id: number } {
+  const components = Identifier_unpack(id)
+  if (components[0] !== "Study") throw new Error("400.invalid-identifier")
+  const result = components.slice(1).map((x) => Number.parse(x) ?? 0)
+  return { admin_id: result[0] }
+}
+export function Participant_pack_id(components: { study_id?: string }): string {
+  return components.study_id || ""
+}
+export function Participant_unpack_id(id: string): { study_id: string } {
+  return { study_id: id }
+}
+export function Activity_pack_id(components: { ctest_id?: number; survey_id?: number; group_id?: number }): string {
+  return Identifier_pack(["Activity", components.ctest_id || 0, components.survey_id || 0, components.group_id || 0])
+}
+export function Activity_unpack_id(id: string): { ctest_id: number; survey_id: number; group_id: number } {
+  const components = Identifier_unpack(id)
+  if (components[0] !== "Activity") throw new Error("400.invalid-identifier")
+  const result = components.slice(1).map((x) => Number.parse(x) ?? 0)
+  return {
+    ctest_id: result[0],
+    survey_id: result[1],
+    group_id: result[2],
+  }
+}
 
 export const ActivityIndex: any[] = [
   {
@@ -1101,3 +1452,111 @@ export const ActivityIndex: any[] = [
     LegacyCTestID: 20,
   },
 ]
+
+// TODO: below is to convert legacy scheduling into modern cron-like versions
+/* FIXME:
+$obj->schedule = isset($raw->schedule) ? array_merge(...array_map(function($x) {
+	$duration = new DurationInterval(); $ri = $x->repeat_interval;
+	if ($ri >= 0 && $ri <= 4) { // hourly
+		$h = ($ri == 4 ? 12 : ($ri == 3 ? 6 : ($ri == 2 ? 3 : 1)));
+		$duration->interval = new CalendarComponents();
+		$duration->interval->hour = $h;
+	} else if ($ri >= 5 && $ri <= 10) { // weekly+
+		if ($ri == 6) {
+			$duration = [
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
+			];
+			$duration[0]->interval->weekday = 2;
+			$duration[1]->interval->weekday = 4;
+		} else if ($ri == 7) {
+			$duration = [
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents()), 
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
+			];
+			$duration[0]->interval->weekday = 1;
+			$duration[1]->interval->weekday = 3;
+			$duration[2]->interval->weekday = 5;
+		} else {
+			$duration = [
+				new DurationInterval(strtotime($x->time) * 1000, new CalendarComponents())
+			];
+			$duration[0]->interval->day = ($ri == 5 ? 1 : null);
+			$duration[0]->interval->week_of_month = ($ri == 9 ? 2 : ($ri == 8 ? 1 : null));
+			$duration[0]->interval->month = ($ri == 10 ? 1 : null);
+		}
+	} else if ($ri == 11 && count($x->custom_time) == 1) { // custom+
+		$duration->start = strtotime($x->custom_time[0]) * 1000;
+		$duration->repeat_count = 1;
+	} else if ($ri == 11 && count($x->custom_time) > 2) { // custom*
+		$int_comp = (new DateTime($x->custom_time[0]))
+						->diff(new DateTime($x->custom_time[1]));
+		$duration->start = strtotime($x->custom_time[0]) * 1000;
+		$duration->interval = new CalendarComponents();
+		$duration->interval->year = ($int_comp->y == 0 ? null : $int_comp->y);
+		$duration->interval->month = ($int_comp->m == 0 ? null : $int_comp->m);
+		$duration->interval->day = ($int_comp->d == 0 ? null : $int_comp->d);
+		$duration->interval->hour = ($int_comp->h == 0 ? null : $int_comp->h);
+		$duration->interval->minute = ($int_comp->i == 0 ? null : $int_comp->i);
+		$duration->interval->second = ($int_comp->s == 0 ? null : $int_comp->s);
+		$duration->repeat_count = count($x->custom_time) - 1;
+	} else if ($ri == 12) { // none
+		$duration->start = strtotime($x->time) * 1000;
+		$duration->repeat_count = 1;
+	}
+	return is_array($duration) ? $duration : [$duration];
+}, $raw->schedule)) : null;
+*/
+
+// Schedule:
+//      - Admin_CTestSchedule, Admin_SurveySchedule
+//          - AdminID, CTestID/SurveyID, Version*(C), ScheduleDate, SlotID, Time, RepeatID, IsDeleted
+//      - Admin_CTestScheduleCustomTime, Admin_SurveyScheduleCustomTime, Admin_BatchScheduleCustomTime
+//          - Time
+//      - Admin_BatchSchedule
+//          - AdminID, BatchName, ScheduleDate, SlotID, Time, RepeatID, IsDeleted
+//      - Admin_BatchScheduleCTest, Admin_BatchScheduleSurvey
+//          - CTestID/SurveyID, Version*(C), Order
+//
+// Settings:
+//      - Admin_CTestSurveySettings
+//          - AdminID, CTestID, SurveyID
+//      - Admin_JewelsTrailsASettings, Admin_JewelsTrailsBSettings
+//          - AdminID, ... (")
+//      - SurveyQuestions
+//          - SurveyID, QuestionText, AnswerType, IsDeleted
+//      - SurveyQuestionsOptions
+//          - QuestionID, OptionText
+
+// https://en.wikipedia.org/wiki/Cron#CRON_expression
+/*
+* * * * * *
+| | | | | | 
+| | | | | +-- Year              (range: 1900-3000)
+| | | | +---- Day of the Week   (range: 1-7; L=last, #=ordinal(range: 1-4))
+| | | +------ Month of the Year (range: 1-12)
+| | +-------- Day of the Month  (range: 1-31; L=last, W=nearest-weekday, #=ordinal(range: 1-52))
+| +---------- Hour              (range: 0-23)
++------------ Minute            (range: 0-59)
+*/
+
+/*
+
+
+
+enum RepeatTypeLegacy {
+	hourly = 'hourly', // 0 * * * * *
+	every3h = 'every3h', // 0 * /3 * * * *
+	every6h = 'every6h', // 0 * /6 * * * *
+	every12h = 'every12h', // 0 * /12 * * * *
+	daily = 'daily', // 0 0 * * * *
+	weekly = 'weekly', // 0 0 * * 0 *
+	biweekly = 'biweekly', // 0 0 1,15 * * *
+	monthly = 'monthly', // 0 0 1 * * *
+	bimonthly = 'bimonthly', // 0 0 1 * /2 * *
+	custom = 'custom', // 1 2 3 4 5 6
+	none = 'none' // 0 0 0 0 0 0
+}
+
+*/

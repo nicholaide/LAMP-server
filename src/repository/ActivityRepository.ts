@@ -1,130 +1,19 @@
-import { SQL, Encrypt, Decrypt } from "../app"
-import { IResult } from "mssql"
+import { SQL, Database } from "../app"
 import { Activity } from "../model/Activity"
-import { Participant } from "../model/Participant"
-import { Study } from "../model/Study"
-import { Researcher } from "../model/Researcher"
-import { ActivitySpec } from "../model/ActivitySpec"
-import { DurationIntervalLegacy } from "../model/Document"
-import { ResearcherRepository } from "../repository/ResearcherRepository"
-import { StudyRepository } from "../repository/StudyRepository"
-import { ParticipantRepository } from "../repository/ParticipantRepository"
 import { TypeRepository } from "../repository/TypeRepository"
-import { Identifier_unpack, Identifier_pack } from "../repository/TypeRepository"
-import { ActivityIndex } from "./migrate"
+import {
+  ActivityIndex,
+  _migrator_dual_table,
+  Activity_pack_id,
+  Researcher_unpack_id,
+  Study_unpack_id,
+  Activity_unpack_id,
+  Identifier_unpack,
+} from "./migrate"
+import { customAlphabet } from "nanoid"
+const uuid = customAlphabet("1234567890abcdefghjkmnpqrstvwxyz", 20) // crockford-32
 
 export class ActivityRepository {
-  /**
-   *
-   */
-  public static _pack_id(components: {
-    /**
-     *
-     */
-    ctest_id?: number
-
-    /**
-     *
-     */
-    survey_id?: number
-
-    /**
-     *
-     */
-    group_id?: number
-  }): string {
-    return Identifier_pack([
-      (<any>Activity).name,
-      components.ctest_id || 0,
-      components.survey_id || 0,
-      components.group_id || 0,
-    ])
-  }
-
-  /**
-   *
-   */
-  public static _unpack_id(
-    id: string
-  ): {
-    /**
-     *
-     */
-    ctest_id: number
-
-    /**
-     *
-     */
-    survey_id: number
-
-    /**
-     *
-     */
-    group_id: number
-  } {
-    const components = Identifier_unpack(id)
-    if (components[0] !== (<any>Activity).name) throw new Error("400.invalid-identifier")
-    const result = components.slice(1).map((x) => Number.parse(x) ?? 0)
-    return {
-      ctest_id: result[0],
-      survey_id: result[1],
-      group_id: result[2],
-    }
-  }
-
-  /**
-   *
-   */
-  public static async _parent_id(id: string, type: Function): Promise<string | undefined> {
-    const { ctest_id, survey_id, group_id } = ActivityRepository._unpack_id(id)
-    switch (type) {
-      case StudyRepository:
-      case ResearcherRepository:
-        if (survey_id > 0 /* survey */) {
-          const result = (
-            await SQL!.request().query(`
-						SELECT AdminID AS value
-						FROM Survey
-						WHERE IsDeleted = 0 AND SurveyID = '${survey_id}'
-					;`)
-          ).recordset
-          return result.length === 0
-            ? undefined
-            : (type === ResearcherRepository ? ResearcherRepository : StudyRepository)._pack_id({
-                admin_id: result[0].value,
-              })
-        } else if (ctest_id > 0 /* ctest */) {
-          const result = (
-            await SQL!.request().query(`
-						SELECT AdminID AS value
-						FROM Admin_CTestSettings
-						WHERE Status = 1 AND AdminCTestSettingID = '${ctest_id}'
-					;`)
-          ).recordset
-          return result.length === 0
-            ? undefined
-            : (type === ResearcherRepository ? ResearcherRepository : StudyRepository)._pack_id({
-                admin_id: result[0].value,
-              })
-        } else if (group_id > 0 /* group */) {
-          const result = (
-            await SQL!.request().query(`
-						SELECT AdminID AS value
-						FROM Admin_BatchSchedule
-						WHERE IsDeleted = 0 AND AdminBatchSchID = '${ctest_id}'
-					;`)
-          ).recordset
-          return result.length === 0
-            ? undefined
-            : (type === ResearcherRepository ? ResearcherRepository : StudyRepository)._pack_id({
-                admin_id: result[0].value,
-              })
-        } else return undefined
-      default:
-        throw new Error("400.invalid-identifier")
-    }
-  }
-
   // FIXME: Use AdminCTestSettings for CTest ID
 
   /**
@@ -136,21 +25,33 @@ export class ActivityRepository {
      */
     id?: string
   ): Promise<Activity[]> {
+    const [_lookup_table, _export_table] = await _migrator_dual_table()
+    id = !!id ? _export_table[id!] ?? id! : undefined
+    const _lookup_export_id = (legacyID: string): string => {
+      let match = _lookup_table[legacyID]
+      if (match === undefined) {
+        match = uuid() // 20-char id for non-Participant objects
+        _lookup_table[legacyID] = match
+        console.log(`inserting migrator link: ${legacyID} => ${match}`)
+        Database.use("root").insert({ _id: `_local/${legacyID}`, value: match } as any)
+      }
+      return match
+    }
+
     // Get the correctly scoped identifier to search within.
     let ctest_id: number | undefined
     let survey_id: number | undefined
     let group_id: number | undefined
     let admin_id: number | undefined
-    if (!!id && Identifier_unpack(id)[0] === (<any>Researcher).name)
-      admin_id = ResearcherRepository._unpack_id(id).admin_id
-    else if (!!id && Identifier_unpack(id)[0] === (<any>Study).name) admin_id = StudyRepository._unpack_id(id).admin_id
-    else if (!!id && Identifier_unpack(id)[0] === (<any>Activity).name) {
-      const c = ActivityRepository._unpack_id(id)
+    if (!!id && Identifier_unpack(id)[0] === "Researcher") admin_id = Researcher_unpack_id(id).admin_id
+    else if (!!id && Identifier_unpack(id)[0] === "Study") admin_id = Study_unpack_id(id).admin_id
+    else if (!!id && Identifier_unpack(id)[0] === "Activity") {
+      const c = Activity_unpack_id(id)
       ctest_id = c.ctest_id
       survey_id = c.survey_id
       group_id = c.group_id
     } else if (!!id && Identifier_unpack(id).length === 0 /* Participant */)
-      admin_id = ResearcherRepository._unpack_id((<any>await TypeRepository._parent(<string>id))["Researcher"]).admin_id
+      admin_id = Researcher_unpack_id(((await TypeRepository._parent(id)) as any)["Researcher"]).admin_id
     else if (!!id) throw new Error("400.invalid-identifier")
 
     const resultBatch = (
@@ -360,9 +261,7 @@ export class ActivityRepository {
     return [...resultBatch, ...resultSurvey, ...resultTest].map((raw: any) => {
       const obj = new Activity()
       if (raw.type === "batch") {
-        obj.id = ActivityRepository._pack_id({
-          group_id: raw.id,
-        })
+        obj.id = _lookup_export_id(Activity_pack_id({ group_id: raw.id }))
         obj.spec = "lamp.group"
         obj.name = raw.name
         obj.settings = [
@@ -371,10 +270,12 @@ export class ActivityRepository {
         ]
           .sort((x: any, y: any) => x.order - y.order)
           .map((x: any) =>
-            ActivityRepository._pack_id({
-              ctest_id: !x.ctest_id ? undefined : x.ctest_id,
-              survey_id: !x.survey_id ? undefined : x.survey_id,
-            })
+            _lookup_export_id(
+              Activity_pack_id({
+                ctest_id: !x.ctest_id ? undefined : x.ctest_id,
+                survey_id: !x.survey_id ? undefined : x.survey_id,
+              })
+            )
           )
         obj.schedule = resultBatchSchedule
           .filter((x) => x.id === raw.id)
@@ -384,9 +285,7 @@ export class ActivityRepository {
             custom_time: !x.custom_time ? null : JSON.parse(x.custom_time).map((y: any) => y.t),
           })) as any
       } else if (raw.type === "survey") {
-        obj.id = ActivityRepository._pack_id({
-          survey_id: raw.id,
-        })
+        obj.id = _lookup_export_id(Activity_pack_id({ survey_id: raw.id }))
         obj.spec = "lamp.survey"
         obj.name = raw.name
         obj.settings = resultSurveyQuestions
@@ -404,10 +303,7 @@ export class ActivityRepository {
             custom_time: !x.custom_time ? null : JSON.parse(x.custom_time).map((y: any) => y.t),
           })) as any
       } else if (raw.type === "ctest") {
-        obj.id = ActivityRepository._pack_id({
-          ctest_id: raw.id,
-        })
-
+        obj.id = _lookup_export_id(Activity_pack_id({ ctest_id: raw.id }))
         // FIXME: account for Forward/Backward variants that are not mapped!
         const specEntry = ActivityIndex.find((x) => x.LegacyCTestID === Number.parse(raw.ctest_id))
         obj.spec = specEntry.Name
@@ -447,7 +343,23 @@ export class ActivityRepository {
      */
     object: Activity
   ): Promise<string> {
-    const { admin_id } = StudyRepository._unpack_id(study_id)
+    const [_lookup_table, _export_table] = await _migrator_dual_table()
+    const _export_or_die = (id: string) => {
+      if (_export_table[id]) return _export_table[id]
+      else throw new Error("500.invalid-migratable-id")
+    }
+    const _lookup_export_id = (legacyID: string): string => {
+      let match = _lookup_table[legacyID]
+      if (match === undefined) {
+        match = uuid() // 20-char id for non-Participant objects
+        _lookup_table[legacyID] = match
+        console.log(`inserting migrator link: ${legacyID} => ${match}`)
+        Database.use("root").insert({ _id: `_local/${legacyID}`, value: match } as any)
+      }
+      return match
+    }
+
+    const { admin_id } = Study_unpack_id(_export_or_die(study_id))
     const transaction = SQL!.transaction()
     await transaction.begin()
     try {
@@ -524,7 +436,7 @@ export class ActivityRepository {
         }
 
         // Get CTest spec list.
-        const items = object.settings.map((x, idx) => ({ ...ActivityRepository._unpack_id(x), idx }))
+        const items = object.settings.map((x, idx) => ({ ...Activity_unpack_id(_export_or_die(x)), idx }))
         if (items.filter((x) => x.group_id > 0).length > 0) throw new Error("400.nested-objects-unsupported")
 
         // Create the CTest and Survey lists.
@@ -569,9 +481,7 @@ export class ActivityRepository {
 
         // Return the new ID.
         await transaction.commit()
-        return ActivityRepository._pack_id({
-          group_id: batch_id,
-        })
+        return _lookup_export_id(Activity_pack_id({ group_id: batch_id }))
       } else if (object.spec === "lamp.survey" /* survey */) {
         const result1 = await transaction.request().query(`
 					INSERT INTO Survey (AdminID, SurveyName) 
@@ -696,9 +606,7 @@ export class ActivityRepository {
 
         // Return the new ID.
         await transaction.commit()
-        return ActivityRepository._pack_id({
-          survey_id: survey_id,
-        })
+        return _lookup_export_id(Activity_pack_id({ survey_id: survey_id }))
       } /* cognitive test */ else {
         const ctest_id = ActivityIndex.find((x) => x.Name === object.spec)?.[0]?.LegacyCTestID ?? -1
 
@@ -828,9 +736,7 @@ export class ActivityRepository {
 
         // Return the new ID.
         await transaction.commit()
-        return ActivityRepository._pack_id({
-          ctest_id: _actual_setting_id,
-        })
+        return _lookup_export_id(Activity_pack_id({ ctest_id: _actual_setting_id }))
       }
     } catch (e) {
       await transaction.rollback()
@@ -853,7 +759,12 @@ export class ActivityRepository {
      */
     object: any
   ): Promise<{}> {
-    const { ctest_id, survey_id, group_id } = ActivityRepository._unpack_id(activity_id)
+    const [, _export_table] = await _migrator_dual_table()
+    const _export_or_die = (id: string) => {
+      if (_export_table[id]) return _export_table[id]
+      else throw new Error("500.invalid-migratable-id")
+    }
+    const { ctest_id, survey_id, group_id } = Activity_unpack_id(_export_or_die(activity_id))
 
     if (typeof object.spec === "string") throw new Error("400.update-failed-modifying-activityspec-is-illegal")
 
@@ -930,7 +841,7 @@ export class ActivityRepository {
         // Modify batch settings.
         if (Array.isArray(object.settings)) {
           const items = (object.settings as Array<string>).map((x, idx) => ({
-            ...ActivityRepository._unpack_id(x),
+            ...Activity_unpack_id(_export_or_die(x)),
             idx,
           }))
 
@@ -1287,7 +1198,8 @@ export class ActivityRepository {
      */
     activity_id: string
   ): Promise<{}> {
-    const { ctest_id, survey_id, group_id } = ActivityRepository._unpack_id(activity_id)
+    const [, _export_table] = await _migrator_dual_table()
+    const { ctest_id, survey_id, group_id } = Activity_unpack_id(_export_table[activity_id])
     const transaction = SQL!.transaction()
     await transaction.begin()
     try {
@@ -1407,13 +1319,13 @@ const _escapeMSSQL = (val: string) =>
 
 // threshold & operator hard-coded matches
 const _opMatch = (val: string) =>
-  (<any>{
+  (({
     "Today I have thoughts of self-harm": {
       tr: 1,
       op: `'1'`,
       msg: `'Please remember that this app is not monitored.  If you are having thoughts of suicide or self-harm, please call 1-800-273-8255.'`,
     },
-  })[val]
+  } as any)[val])
 
 /**
  * Produce the internal-only Jewels A/B settings mappings.
@@ -1432,8 +1344,8 @@ function jewelsMap(
    * Either false for column mapping, or true for defaults mapping.
    */
   variety = false
-) {
-  return (<any>(!variety
+): any {
+  return ((!variety
     ? {
         beginner_seconds: "NoOfSeconds_Beg",
         intermediate_seconds: "NoOfSeconds_Int",
@@ -1459,5 +1371,5 @@ function jewelsMap(
         x_diamond_count: 0,
         y_changes_in_level_count: 0,
         y_shape_count: 0,
-      }))[key]
+      }) as any)[key]
 }

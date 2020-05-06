@@ -133,11 +133,6 @@ fARYG40rIsYJipV76ICGNXSp
 export let SQL: sql.ConnectionPool | undefined
 
 /**
- *
- */
-export const Root = { id: "root", password: process.env.ROOT_PASSWORD || "" }
-
-/**
  * If the data could not be encrypted or is invalid, returns `undefined`.
  */
 export const Encrypt = (data: string, mode: "Rijndael" | "AES256" = "Rijndael"): string | undefined => {
@@ -208,12 +203,12 @@ async function main() {
   app.get("/", async (req, res) => res.json(_openAPIschema))
   app.get("/favicon.ico", (req, res) => res.status(204))
   app.get("/service-worker.js", (req, res) => res.status(204))
-  app.get("/_utils", (req, res) => {
-    if (req.query.key !== Root.password) return res.status(400).json({ message: "invalid credentials" })
+  /*app.get("/_utils", (req, res) => {
+    if (req.query.key !== _rootPassword) return res.status(400).json({ message: "invalid credentials" })
     if (req.query.func === "crypto")
       return res.status(200).json((req.query.type === "encrypt" ? Encrypt : Decrypt)(req.query.data, req.query.mode))
     return res.status(400).json({ message: "invalid utility function" })
-  })
+  })*/
   app.all("*", (req, res) => res.status(404).json({ message: "404.api-endpoint-unimplemented" }))
 
   // Establish the SQL connection.
