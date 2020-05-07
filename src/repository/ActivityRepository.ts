@@ -51,7 +51,7 @@ export class ActivityRepository {
       survey_id = c.survey_id
       group_id = c.group_id
     } else if (!!id && Identifier_unpack(id).length === 0 /* Participant */)
-      admin_id = Researcher_unpack_id(((await TypeRepository._parent(id)) as any)["Researcher"]).admin_id
+      admin_id = Study_unpack_id(_export_table[(await TypeRepository._owner(id)) as any]).admin_id
     else if (!!id) throw new Error("400.invalid-identifier")
 
     const resultBatch = (

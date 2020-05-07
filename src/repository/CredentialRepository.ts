@@ -15,19 +15,22 @@ export class CredentialRepository {
           limit: 2_147_483_647 /* 32-bit INT_MAX */,
         })
       ).docs.map((x: any) => x.secret_key)
-      if (_all.length === 0) throw new Error()
-    } catch (e) {
-      // eslint-disable-next-line
+      if (_all.length === 0) {
+        // eslint-disable-next-line
       console.dir(`Because no master configuration could be located, an initial administrator password was generated and saved for this installation.`)
-      const p = crypto.randomBytes(32).toString("hex")
-      console.table({ "Administrator Password": p })
-      _all = [Encrypt(p, "AES256") as string]
-      await Database.use("credential").insert({
-        origin: null,
-        access_key: "admin",
-        secret_key: _all[0],
-        description: "System Administrator Credential",
-      } as any)
+        const p = crypto.randomBytes(32).toString("hex")
+        console.table({ "Administrator Password": p })
+        _all = [Encrypt(p, "AES256") as string]
+        await Database.use("credential").insert({
+          origin: null,
+          access_key: "admin",
+          secret_key: _all[0],
+          description: "System Administrator Credential",
+        } as any)
+      }
+    } catch (e) {
+      console.dir(e)
+      return false
     }
     return _all.filter((key) => Decrypt(key, "AES256") === admin_secret_key).length > 0
   }
@@ -39,7 +42,7 @@ export class CredentialRepository {
         selector: { access_key: access_key },
         limit: 2_147_483_647 /* 32-bit INT_MAX */,
       })
-    ).docs//.filter((x: any) => (!!secret_key ? Decrypt(x.secret_key, "AES256") === secret_key : true))
+    ).docs.filter((x: any) => (!!secret_key ? Decrypt(x.secret_key, "AES256") === secret_key : true))
     if (res.length !== 0) return (res[0] as any).origin
     throw new Error("403.no-such-credentials")
   }
